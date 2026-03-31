@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 fn main() {
-    let mut stream = TcpStream::connect("127.0.0.1:8080").unwrap();
+    let mut leader = TcpStream::connect("127.0.0.1:8080").unwrap();
 
     let commands = vec![
         "SET user1 Alice 10\n",
@@ -26,13 +26,20 @@ fn main() {
 
     for cmd in commands {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        stream.write_all(cmd.as_bytes()).unwrap();
+        leader.write_all(cmd.as_bytes()).unwrap();
 
         let mut buffer = [0; 1024];
-        let n = stream.read(&mut buffer).unwrap();
+        let n = leader.read(&mut buffer).unwrap();
 
-        println!("Response: {}", String::from_utf8_lossy(&buffer[..n]));
+        println!("Leader Response: {}", String::from_utf8_lossy(&buffer[..n]));
     }
+
+    let mut follower = TcpStream::connect("127.0.0.1:8081").unwrap();
+
+    follower.write_all(b"GET name\n").unwrap();
+    let mut buffer = [0; 1024];
+    let n = follower.read(&mut buffer).unwrap();
+    println!("Follower Response: {}", String::from_utf8_lossy(&buffer[..n]));
 }
 
 // Day 1&2 - TCP Echo Client
