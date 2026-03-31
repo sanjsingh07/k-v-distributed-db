@@ -6,8 +6,7 @@ use tokio::{
 };
 
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::{HashMap},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -96,7 +95,7 @@ async fn handle_client(
 
                 if matches!(config.role, NodeRole::Follower) && is_write && !is_forwarded {
                     let forward_req = format!("FORWARD {}\n", received);
-                    let response = forward_request(&config.leader_addr, &forward_req).await;
+                    let response = forward_with_retry(&config.leader_addr, &forward_req, 3).await;
                     socket.write_all(response.as_bytes()).await.unwrap();
                     continue;
                 }
@@ -125,9 +124,12 @@ async fn handle_client(
                                 let peers = config.peers.clone();
                                 let req = received.clone();
 
-                                tokio::spawn(async move {
-                                    replicate_to_followers(&peers, &req).await;
-                                });
+                                let success = replicate_with_quorum(&peers, &req).await;
+
+                                if !success {
+                                    eprintln!("ERR replication failed (quorum not reached)\n");
+                                    return;
+                                }
                             }
 
                             format!("OK: {} set to {}\n", key, value)
@@ -167,9 +169,12 @@ async fn handle_client(
                                     let peers = config.peers.clone();
                                     let req = received.clone();
 
-                                    tokio::spawn(async move {
-                                        replicate_to_followers(&peers, &req).await;
-                                    });
+                                    let success = replicate_with_quorum(&peers, &req).await;
+
+                                    if !success {
+                                        eprintln!("ERR replication failed (quorum not reached)\n");
+                                        return;
+                                    }
                                 }
                                 format!("OK: {} deleted\n", key)
                             } else {
@@ -227,9 +232,14 @@ async fn handle_client(
                                         let peers = config.peers.clone();
                                         let req = received.clone();
 
-                                        tokio::spawn(async move {
-                                            replicate_to_followers(&peers, &req).await;
-                                        });
+                                        let success = replicate_with_quorum(&peers, &req).await;
+
+                                        if !success {
+                                            eprintln!(
+                                                "ERR replication failed (quorum not reached)\n"
+                                            );
+                                            return;
+                                        }
                                     }
                                     format!("OK: {} is now persistent\n", key)
                                 }
@@ -256,27 +266,6 @@ async fn handle_client(
     }
 }
 
-async fn replicate_to_followers(peers: &[String], request: &str) {
-    for peer in peers {
-        let req = format!("FORWARD {}\n", request);
-
-        tokio::spawn({
-            let peer = peer.clone();
-            let req = req.clone();
-            let request = request.to_string();
-
-            async move {
-
-                println!("[REPLICATION] Sending '{}' → {}", request, peer);
-
-                let response = forward_with_retry(&peer, &req, 3).await;
-
-                println!("[REPLICATION] Response from {} → {}", peer, response.trim());
-            }
-        });
-    }
-}
-
 async fn forward_with_retry(node_addr: &str, request: &str, retries: usize) -> String {
     let mut attempt = 0;
 
@@ -285,7 +274,9 @@ async fn forward_with_retry(node_addr: &str, request: &str, retries: usize) -> S
 
         println!(
             "[RETRY] Attempt {} → sending '{}' to {}",
-            attempt, request.trim(), node_addr
+            attempt,
+            request.trim(),
+            node_addr
         );
 
         let result = forward_request(node_addr, request).await;
@@ -295,15 +286,51 @@ async fn forward_with_retry(node_addr: &str, request: &str, retries: usize) -> S
         }
 
         if attempt >= retries {
-            println!(
-                "[RETRY] Failed after {} attempts → {}",
-                retries, node_addr
-            );
+            println!("[RETRY] Failed after {} attempts → {}", retries, node_addr);
             return result;
         }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+async fn replicate_with_quorum(peers: &[String], request: &str) -> bool {
+    let total_nodes = peers.len() + 1; // + leader
+    let quorum = total_nodes / 2 + 1;
+
+    let mut success_count = 1; // leader itself
+
+    let mut handles = vec![];
+
+    for peer in peers {
+        let req = format!("FORWARD {}\n", request);
+        let peer = peer.clone();
+
+        let handle = tokio::spawn(async move {
+            let response = forward_with_retry(&peer, &req, 3).await;
+
+            println!("[QUORUM] {} → {}", peer, response.trim());
+
+            !response.starts_with("ERR")
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        if let Ok(success) = handle.await {
+            if success {
+                success_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "[QUORUM] Success: {}/{} (required: {})",
+        success_count, total_nodes, quorum
+    );
+
+    success_count >= quorum
 }
 
 async fn forward_request(node_addr: &str, request: &str) -> String {
