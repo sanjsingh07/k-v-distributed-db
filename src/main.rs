@@ -6,7 +6,7 @@ use tokio::{
 };
 
 use std::{
-    collections::{HashMap},
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -118,6 +118,7 @@ async fn handle_client(
 
                             let mut db_lock = db.write().await;
                             db_lock.insert(key.clone(), (value.clone(), expire_time));
+                            drop(db_lock);
 
                             // REPLICATION (only if leader and not forwarded)
                             if matches!(config.role, NodeRole::Leader) && !is_forwarded {
@@ -127,6 +128,8 @@ async fn handle_client(
                                 let success = replicate_with_quorum(&peers, &req).await;
 
                                 if !success {
+                                    let mut db_lock = db.write().await;
+                                    db_lock.remove(&key); // rollback
                                     eprintln!("ERR replication failed (quorum not reached)\n");
                                     return;
                                 }
