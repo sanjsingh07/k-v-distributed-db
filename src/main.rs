@@ -1,7 +1,7 @@
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc},
     time::timeout,
 };
 
@@ -18,10 +18,19 @@ use chrono::Local;
 
 const MAX_MSG_SIZE: usize = 512;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum NodeRole {
     Leader,
     Follower,
+    Candidate,
+}
+
+#[derive(Debug)]
+struct NodeState {
+    role: NodeRole,
+    current_term: u64,
+    voted_for: Option<String>,
+    last_heartbeat: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +46,7 @@ async fn handle_client(
     connection_count: Arc<AtomicUsize>,
     db: Arc<RwLock<HashMap<String, (String, Option<Instant>)>>>,
     config: Arc<NodeConfig>,
+    state: Arc<Mutex<NodeState>>,
 ) {
     let addr = socket.peer_addr().unwrap();
 
@@ -89,11 +99,31 @@ async fn handle_client(
 
                 let command = command_parts[0].to_uppercase();
 
+                if command == "HEARTBEAT" {
+                    let mut state_lock = state.lock().await;
+
+                    state_lock.last_heartbeat = Instant::now();
+                    state_lock.role = NodeRole::Follower;
+
+                    return;
+                }
+
+                if command == "VOTE_REQUEST" {
+                    let mut state_lock = state.lock().await;
+
+                    if state_lock.voted_for.is_none() {
+                        state_lock.voted_for = Some(parts[1].to_string());
+                        return socket.write_all(b"YES\n").await.unwrap();
+                    } else {
+                        return socket.write_all(b"NO\n").await.unwrap();
+                    }
+                }
+
                 let is_write = matches!(command.as_str(), "SET" | "DELETE" | "PERSIST");
 
                 let key = command_parts.get(1).unwrap_or(&"").to_string();
 
-                if matches!(config.role, NodeRole::Follower) && is_write && !is_forwarded {
+                if matches!(state.lock().await.role, NodeRole::Follower) && is_write && !is_forwarded {
                     let forward_req = format!("FORWARD {}\n", received);
                     let response = forward_with_retry(&config.leader_addr, &forward_req, 3).await;
                     socket.write_all(response.as_bytes()).await.unwrap();
@@ -121,7 +151,7 @@ async fn handle_client(
                             drop(db_lock);
 
                             // REPLICATION (only if leader and not forwarded)
-                            if matches!(config.role, NodeRole::Leader) && !is_forwarded {
+                            if matches!(state.lock().await.role, NodeRole::Leader) && !is_forwarded {
                                 let peers = config.peers.clone();
                                 let req = received.clone();
 
@@ -168,7 +198,7 @@ async fn handle_client(
                         } else {
                             let mut db_lock = db.write().await;
                             if db_lock.remove(&key).is_some() {
-                                if matches!(config.role, NodeRole::Leader) && !is_forwarded {
+                                if matches!(state.lock().await.role, NodeRole::Leader) && !is_forwarded {
                                     let peers = config.peers.clone();
                                     let req = received.clone();
 
@@ -231,7 +261,7 @@ async fn handle_client(
                                 Some((_, expiry)) => {
                                     *expiry = None;
 
-                                    if matches!(config.role, NodeRole::Leader) && !is_forwarded {
+                                    if matches!(state.lock().await.role, NodeRole::Leader) && !is_forwarded {
                                         let peers = config.peers.clone();
                                         let req = received.clone();
 
@@ -354,6 +384,105 @@ async fn forward_request(node_addr: &str, request: &str) -> String {
     }
 }
 
+fn start_failure_detector(state: Arc<Mutex<NodeState>>, config: Arc<NodeConfig>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let mut state_lock = state.lock().await;
+
+            if state_lock.role == NodeRole::Leader {
+                continue;
+            }
+
+            let elapsed = state_lock.last_heartbeat.elapsed();
+
+            if elapsed > Duration::from_secs(5) {
+                println!("Leader timeout → starting election");
+
+                state_lock.role = NodeRole::Candidate;
+                state_lock.current_term += 1;
+                state_lock.voted_for = Some(config.addr.clone());
+
+                drop(state_lock);
+
+                start_election(state.clone(), config.clone()).await;
+            }
+        }
+    });
+}
+
+async fn start_election(state: Arc<Mutex<NodeState>>, config: Arc<NodeConfig>) {
+    let peers = config.peers.clone();
+
+    let mut votes = 1; // vote for self
+    let total = peers.len() + 1;
+    let majority = total / 2 + 1;
+
+    println!("Starting election...");
+
+    let mut handles = vec![];
+
+    for peer in peers {
+        let request = format!("VOTE_REQUEST {}\n", config.addr);
+
+        let handle = tokio::spawn(async move {
+            let response = forward_request(&peer, &request).await;
+            response.contains("YES")
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        if let Ok(granted) = handle.await {
+            if granted {
+                votes += 1;
+            }
+        }
+    }
+
+    println!("Votes: {}/{}", votes, total);
+
+    let mut state_lock = state.lock().await;
+
+    if votes >= majority {
+        println!("Became LEADER");
+
+        state_lock.role = NodeRole::Leader;
+        state_lock.voted_for = None;
+    } else {
+        println!("Election failed");
+
+        state_lock.role = NodeRole::Follower;
+    }
+}
+
+fn start_heartbeat_task(state: Arc<Mutex<NodeState>>, config: Arc<NodeConfig>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let state_lock = state.lock().await;
+
+            if state_lock.role != NodeRole::Leader {
+                continue;
+            }
+
+            let peers = config.peers.clone();
+            drop(state_lock);
+
+            for peer in peers {
+                let msg = format!("HEARTBEAT {}\n", config.addr);
+
+                tokio::spawn(async move {
+                    let _ = forward_request(&peer, &msg).await;
+                });
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -376,6 +505,13 @@ async fn main() {
         }
     };
 
+    let state = Arc::new(Mutex::new(NodeState {
+        role: role.clone(),
+        current_term: 0,
+        voted_for: None,
+        last_heartbeat: Instant::now(),
+    }));
+
     // hardcoded peers (for now)
     let peers = vec![
         "127.0.0.1:8080".to_string(),
@@ -395,6 +531,9 @@ async fn main() {
         role,
         leader_addr,
     });
+
+    start_heartbeat_task(state.clone(), config.clone());
+    start_failure_detector(state.clone(), config.clone());
 
     let listener = TcpListener::bind(&config.addr).await.unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
@@ -441,6 +580,7 @@ async fn main() {
         let tx = tx.clone();
         let db = db.clone();
         let config = config.clone();
+        let state = state.clone();
 
         tokio::spawn(async move {
             let log_msg = format!("Client connected: {}", addr);
@@ -448,7 +588,7 @@ async fn main() {
                 println!("Failed to send log: {}", e);
             };
 
-            handle_client(socket, connection_count, db, config).await;
+            handle_client(socket, connection_count, db, config, state).await;
         });
     }
 }
